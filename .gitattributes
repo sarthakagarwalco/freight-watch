@@ -1,0 +1,8 @@
+# Normalize line endings to LF so generated CSVs and recorded SHA-256
+# checksums in reproducibility_check.md stay stable across platforms.
+* text=auto
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.csv  text eol=lf
+*.txt  text eol=lf
