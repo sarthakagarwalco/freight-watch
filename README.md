@@ -1,150 +1,51 @@
-# Freight Watch — a smart assistant that watches shipping costs
+# FreightTiger Case Study - Route Cost Monitoring
 
-Built for the FreightTiger Software Engineering Intern (AI) case study.
-It groups 2,940 shipment records into route-weeks, tracks cost per tonne-km,
-flags weeks where cost is rising out of the ordinary, and — before flagging —
-checks a set of context notes (fuel, tolls, weather, festivals) to see whether
-the rise has a genuine explanation. Every verdict cites its evidence; nothing
-is guessed.
+Tracks weekly shipping cost per tonne-km across routes, compares each route-week against its own trailing history and similar-length peers, flags unusual cost spikes, and checks context notes to separate explained disruptions from unexplained anomalies.
 
-**Headline result:** 20 route-weeks flagged (≥20% rise vs own history or vs
-similar routes) → 3 justified by notes (N001 ×2, N002 ×1), 17 unexplained and
-worth a human review. Eval harness: 13/13 checks pass. Three runs:
-byte-identical. LLM cost: ₹0.
-
-## Quickstart
+## Quick Start
 
 ```bash
-pip install -r requirements.txt          # pandas, numpy only
-python3 -m freight_watch.pipeline        # -> output/cost_watch_output.csv
-python3 eval/run_eval.py                  # 13-check eval harness
-python3 -m freight_watch.ask "why did Mumbai-Pune get pricier in December 2025?"
+# Run the main pipeline (writes output/freight_flags.csv and output/all_route_weeks.csv)
+npm run run
+
+# Run validation and sanity checks
+npm run verify
+
+# Query the results via CLI
+node src/ask.mjs "why did Chennai-Bangalore get pricier in March 2025?"
+node src/ask.mjs "which routes were flagged in 2025?"
 ```
 
-## How it works
+Requires Node.js >= 18 (uses built-in Node modules only).
 
-```
-shipment_records.csv ──► analytics.py ──► weekly cost/tonne-km + baselines ──► flag rule ──► 20 candidates
-context_notes.csv    ──► notes.py     ──► curated note metadata (route, window, cost-rise?)
-                                        ──► retrieval.py (vector store: rank candidates)
-                                        ──► verdict.py (deterministic gate + cited reasons)
-                                                                              ──► output CSV
-```
+## Project Layout
 
-**`analytics.py`** — core numbers, exactly per the brief:
-- Route = `origin-destination`, grouped with the given `route_type` (Short/Medium/Long).
-- `week_of` = Monday of the shipment's week (Mon–Sun).
-- `cost_per_tonne_km` = Σ freight_cost / Σ (quantity_tonnes × distance_km), per week.
-- `vs_own_history` = trailing 8-week rolling mean of *strictly prior* weeks
-  (`shift(1)`; `min_periods=1`, so early weeks use whatever history exists —
-  never padded, never extrapolated).
-- `vs_similar_routes` = same-week mean across *other* routes of the same
-  `route_type` (the route itself is excluded).
-- **Flag rule:** cost is *rising* and out of the ordinary —
-  `vs_own_history ≥ 20%` **OR** `vs_similar_routes ≥ 20%`.
+* `output/freight_flags.csv` - Main output file matching `sample_output_format_v2.csv`.
+* `output/all_route_weeks.csv` - Full 728-row route-week dataset with computed baselines.
+* `artifacts/` - Structured JSON outputs (`notes_structured.json`, `results.json`, `run_summary.json`, `reproducibility.json`, `cost_log.json`).
+* `src/pipeline.mjs` - Weekly aggregation and baseline calculations.
+* `src/notes.mjs` - Date-window extraction, polarity filtering, and note matching.
+* `src/explain.mjs` - Template-based reason builder and optional LLM rephrasing hook.
+* `src/eval.mjs` - Automated checks for schema, sample row accuracy, and note attribution.
 
-Why 20%? The three rows in `sample_output_format_v2.csv` are real computed
-values (I reproduced them to the digit: 3.29/+29.5%/+22.5%, 3.98/+9.2%/+23.6%,
-4.17/+35.5%/+21.0%). All three pass a 20%-on-either-baseline filter — including
-the +9.2%/+23.6% row, which only clears the bar via the peer comparison. A
-higher bar would drop a row the sample says should be flagged; a much lower bar
-would flood the output. 20% on either baseline is the threshold consistent with
-the sample.
+## Core Methodology
 
-**`retrieval.py`** — the AI layer. Notes are embedded as TF-IDF vectors in a
-tiny vector store (pure NumPy, written from scratch: fixed sorted vocabulary,
-smoothed IDF, cosine similarity, note_id tiebreak) and ranked against each
-flagged week. Retrieval *proposes* candidates; it never decides.
+1. **Weekly Aggregation:** Shipments are bucketed into Mon-Sun weeks (UTC Monday date as `week_of`). Weekly cost per tonne-km is computed as `sum(freight_cost_inr) / sum(quantity_tonnes * distance_km)` so heavier shipments are weighted proportionally.
+2. **Baselines:**
+   * **Own History:** Mean weekly cost/tonne-km over the route's trailing up to 8 weeks strictly before the current week (no look-ahead).
+   * **Peer Routes:** Mean weekly cost/tonne-km in the same week across all other routes with the same `route_type`.
+3. **Flagging Thresholds:** A route-week is flagged as a candidate when cost is rising (`own_pct > 0`) and exceeds either its own trailing average by `>= 15%` or its peer average by `>= 15%`. This yields 26 candidate route-weeks out of 728 (3 justified, 23 unexplained).
 
-**`notes.py` + `verdict.py`** — the trust layer. A note justifies a flag only if
-all three hold: (1) it applies to the route (exact match or "All Routes"),
-(2) its date window overlaps the flagged week, (3) it actually describes a
-reason for costs *rising*. The third check is a curated per-note flag from a
-careful reading (table below), each backed by an exact quote. Verdicts:
-- `"No (justified)"` + `matched_note_id` — cites the note, its date, and a
-  grounded summary of its content.
-- `"Yes"` + blank `matched_note_id` — names the closest note and the exact
-  reason it doesn't count (wrong route / wrong window / doesn't describe a
-  cost rise), or says plainly that nothing relevant exists. Never guesses.
+## Note Matching & Hallucination Prevention
 
-**`ask.py`** — stretch goal: plain-English Q&A over the assistant's own
-results (deterministic templates, cited; says "I don't know" when the data
-has no answer).
+Rather than passing raw notes to an LLM to guess verdicts, `src/notes.mjs` parses the 10 context notes into structured records first:
+* **Polarity check:** Notes stating that costs remained stable, returned to normal, or were unaffected (N004-N010) are marked `can_justify: false` upfront. Only N001, N002, and N003 represent upward cost pressure.
+* **Matching rule:** A candidate week is marked `No (justified)` only if a note has `can_justify: true`, matches the route (exact route or `All Routes`), and its effective date window overlaps that Mon-Sun week.
+* **Unexplained fallback:** If no qualifying note matches, `matched_note_id` is left empty and `flagged` is set to `Yes`. If a non-qualifying note exists within 28 days for that route, the reason explicitly notes why it does not explain the spike (matching the format in the sample output).
 
-## Why no generative LLM (deliberate trade-off)
+An optional `--llm` flag (`src/llm.mjs`) is supported to rephrase the generated reason text via an OpenAI-compatible API, while keeping all numbers, verdicts, and note IDs locked to the deterministic pipeline.
 
-The brief grades anti-hallucination hardest ("a confident wrong reason scores
-worse than 'couldn't find one'"), demands bit-identical repeat runs, and asks
-for an honest token/cost log. A generative LLM adds nondeterminism and a
-hallucination surface to exactly the step under strictest scrutiny, while buying
-nothing at this scale: 10 notes, and an acceptance rule fully expressible as
-deterministic logic. So the "AI" here is retrieval (a real vector-search
-pattern), the verdicts are provable, the cost is ₹0, and three runs are
-byte-identical. The swap-in point for neural embeddings is documented in
-`retrieval.py` if scale ever demands it. See `token_cost_log.md`.
+## Key Observations & Limitations
 
-## Note readings (the curated evidence behind every verdict)
-
-| Note | Date / window | Applies to | Cost-rise reason? | Evidence |
-|---|---|---|---|---|
-| N001 | 2025-02-24 → 2025-03-08 | Chennai-Bangalore | **Yes** | "forcing longer detours and higher trip costs" |
-| N002 | 2025-01-20 (week) | Ahmedabad-Mumbai | **Yes** | "a temporary surcharge applied by transporters" |
-| N003 | 2025-05-05 (week) | All Routes | **Yes** | "pushing up transportation costs across all routes by roughly 5-7%" |
-| N004 | 2024-03-11 (week) | All Routes | No | "the affected routes are not part of this dataset" |
-| N005 | 2024-07-29 (week) | Mumbai-Delhi | No | "costs were not significantly affected" |
-| N006 | 2025-09-22 (week) | All Routes | No | "no major disruptions reported" |
-| N007 | 2024-05-20 (week) | Delhi-Jaipur | No | "improved road conditions" (resurfacing — not a rise reason) |
-| N008 | 2025-06-09 (week) | Kolkata-Bhubaneswar | No | "No significant disruptions were reported" |
-| N009 | 2025-03-17 (week) | Chennai-Bangalore | No | "returned to normal conditions" |
-| N010 | 2025-10-27 (week) | All Routes | No | "absorbed by transporters without a rate change" |
-
-Deliberate trap cases the system handles correctly:
-- **N010 vs Mumbai-Pune 2025-10-27**: same week, all routes — but explicitly
-  says *no rate change* → stays flagged. (Content gate.)
-- **N001 vs Chennai-Bangalore 2025-03-10**: real flood note, but its window
-  ended Mar 8 and roads were passable by Mar 9 → stays flagged. (Window gate.)
-- **N009 vs Chennai-Bangalore 2025-03-17**: same route, same week — but says
-  the route *returned to normal* → stays flagged. (Content gate.)
-- **N006 vs Mumbai-Pune 2025-09-15**: the temporally closest note, but it
-  reports stable demand → stays flagged, mirroring the sample row's reasoning.
-
-## How I convinced myself it was right
-
-`python3 eval/run_eval.py` — 13/13 checks pass:
-- **Verdict accuracy 20/20** against a hand-labeled set (`eval/labels.json`;
-  each label records the human reasoning in its `why` field).
-- **matched_note_id accuracy 20/20**; every justified row's note passes the
-  strict acceptance test, and no "Yes" row has a note that would pass it
-  (no hallucinations, no missed justifications).
-- **Retrieval quality 3/3**: each justifying note ranks in the retrieval top-2.
-- **Sample rows reproduced exactly** (3/3 numbers match `sample_output_format_v2.csv`).
-- **No look-ahead**: each route's first week has no history baseline.
-- **Format contract**: column names/order and value formats match the sample
-  file exactly (2-decimal costs, `+x.x%` strings, Monday `week_of` dates).
-
-`reproducibility_check.md` records three byte-identical runs (SHA-256).
-
-## Findings summary
-
-- **Ahmedabad-Mumbai, week of 2025-01-20** (+29.5% history, +22.5% peers) —
-  justified by N002 (festival-week surcharge).
-- **Chennai-Bangalore, weeks of 2025-02-24 and 2025-03-03** (+31.5%/+38.7%,
-  +22.8%/+32.0%) — justified by N001 (flood detours). The following two weeks
-  stayed elevated but fall outside the flood window → flagged unexplained.
-- **Delhi-Jaipur, weeks of 2024-11-11 and 2025-11-18** (+35.5%, +27.6% vs
-  history) — no applicable note → flagged unexplained.
-- **Mumbai-Pune, 11 weeks from 2025-06-23 to 2025-12-22** — a sustained
-  elevation vs similar routes (+20% to +39%) while its own history absorbed it
-  (+2% to +9%): the peer baseline is what catches a slow regime shift. No
-  note explains it → all flagged unexplained.
-
-## Limitations & next steps
-
-- The 20% threshold is calibrated to the sample, not learned; with labeled
-  outcomes from reviewers I'd tune it (precision/recall curve).
-- Note windows for single-date notes = the containing week; a note dated
-  mid-week spilling into the next week is a judgment call worth revisiting
-  with the ops team.
-- With thousands of notes I'd swap the TF-IDF store for local neural
-  embeddings (interface-ready in `retrieval.py`) and add reviewer feedback as
-  labels to keep tuning the gate.
+* **Short-route peer skew:** The `Short` category only has two routes: Mumbai-Pune (~150 km) and Delhi-Jaipur (~280 km). Because shorter trips have higher fixed costs per km, Mumbai-Pune consistently sits 15-39% above Delhi-Jaipur and triggers several peer-only flags. In production, grouping peers by finer distance brackets or requiring both own-history and peer thresholds to breach would reduce these false positives.
+* **Open-ended fuel note (N003):** N003 notes a 5-7% nationwide diesel hike starting 2025-05-05. We bound open-ended notes to a 28-day window, though in practice a 5-7% increase stays below the 15% anomaly threshold.

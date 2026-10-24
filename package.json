@@ -1,0 +1,20 @@
+{
+  "name": "freighttiger-cost-watch",
+  "version": "1.0.0",
+  "description": "Route freight cost anomaly detection and context note matching.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "run": "node src/run.mjs",
+    "eval": "node src/eval.mjs",
+    "ask": "node src/ask.mjs",
+    "calibrate": "node scripts/calibrate.mjs",
+    "test": "node tests/independent_check.mjs",
+    "repro": "node scripts/reproducibility.mjs",
+    "cost": "node scripts/cost_log.mjs",
+    "verify": "node src/run.mjs && node scripts/calibrate.mjs && node src/eval.mjs && node tests/independent_check.mjs && node scripts/reproducibility.mjs && node scripts/cost_log.mjs"
+  }
+}
